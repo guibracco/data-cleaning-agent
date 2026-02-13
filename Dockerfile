@@ -16,15 +16,4 @@ COPY . .
 
 EXPOSE 8501
 
-CMD [
-  "poetry",
-  "run",
-  "streamlit",
-  "run",
-  "app.py",
-  "--server.address=0.0.0.0",
-  "--server.port=8501",
-  "--server.headless=true",
-  "--browser.serverAddress=localhost",
-  "--browser.serverPort=8501"
-]
+CMD ["poetry", "run", "streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true", "--browser.serverAddress=localhost", "--browser.serverPort=8501"]
