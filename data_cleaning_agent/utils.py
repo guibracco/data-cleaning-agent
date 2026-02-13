@@ -33,7 +33,10 @@ def get_dataframe_summary(df: pd.DataFrame) -> str:
     str
         A text summary of the DataFrame.
     """
-    missing_stats = (df.isna().sum() / len(df) * 100).sort_values(ascending=False)
+    if len(df) == 0:
+        missing_stats = pd.Series(0.0, index=df.columns, dtype=float)
+    else:
+        missing_stats = (df.isna().sum() / len(df) * 100).sort_values(ascending=False)
     missing_summary = "\n".join([f"{col}: {val:.2f}%" for col, val in missing_stats.items()])
     
     column_types = "\n".join([f"{col}: {dtype}" for col, dtype in df.dtypes.items()])
@@ -50,7 +53,15 @@ def get_dataframe_summary(df: pd.DataFrame) -> str:
     return summary.strip()
 
 
-def execute_agent_code(state, data_key, code_snippet_key, result_key, error_key, agent_function_name):
+def execute_agent_code(
+    state,
+    data_key,
+    code_snippet_key,
+    result_key,
+    error_key,
+    agent_function_name,
+    steps_key=None,
+):
     """
     Execute the generated agent code on the data.
     
@@ -68,11 +79,13 @@ def execute_agent_code(state, data_key, code_snippet_key, result_key, error_key,
         Key to store any error message in.
     agent_function_name : str
         Name of the function to execute from the generated code.
+    steps_key : str, optional
+        Key to store a list of executed cleaning steps in.
     
     Returns
     -------
     dict
-        Dictionary with result and error keys.
+        Dictionary with result, error, and optional cleaning-step keys.
     """
     logger.info("Executing agent code")
     
@@ -94,15 +107,37 @@ def execute_agent_code(state, data_key, code_snippet_key, result_key, error_key,
     # Run the function and handle errors
     agent_error = None
     result = None
+    cleaning_steps = []
     try:
         result = agent_function(df)
+
+        # Backward compatibility:
+        # - DataFrame return: df
+        # - Tuple return: (df_or_dict, cleaning_steps)
+        # - Dict return: {"data_cleaned": ..., "cleaning_steps": ...}
+        if isinstance(result, tuple) and len(result) == 2:
+            result, cleaning_steps = result
+        elif isinstance(result, dict) and "data_cleaned" in result:
+            cleaning_steps = result.get("cleaning_steps", [])
+            result = result["data_cleaned"]
+
         if isinstance(result, pd.DataFrame):
             result = result.to_dict()
+
+        if cleaning_steps is None:
+            cleaning_steps = []
+        elif not isinstance(cleaning_steps, list):
+            cleaning_steps = [str(cleaning_steps)]
+        else:
+            cleaning_steps = [str(step) for step in cleaning_steps]
     except Exception as e:
         logger.error(f"Execution failed: {e}")
         agent_error = f"An error occurred during data cleaning: {str(e)}"
-    
-    return {result_key: result, error_key: agent_error}
+
+    response = {result_key: result, error_key: agent_error}
+    if steps_key is not None:
+        response[steps_key] = cleaning_steps
+    return response
 
 
 def fix_agent_code(state, code_snippet_key, error_key, llm, prompt_template, function_name, retry_count_key="retry_count"):

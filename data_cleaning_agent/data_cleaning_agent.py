@@ -86,8 +86,8 @@ class LightweightDataCleaningAgent:
             Raw dataset to clean.
         user_instructions : str, optional
             Custom cleaning instructions. If None, applies default cleaning steps:
-            removing columns with >40% missing values, imputing missing values,
-            and removing duplicates.
+            removing sparse columns, imputing missing values, removing duplicates,
+            removing outliers, text cleaning, and conservative datatype checks.
         max_retries : int, default=3
             Maximum number of retry attempts if generated code fails.
         retry_count : int, default=0
@@ -114,7 +114,10 @@ class LightweightDataCleaningAgent:
         Retrieves the cleaned data stored after running invoke_agent.
         """
         if self.response:
-            return pd.DataFrame(self.response.get("data_cleaned"))
+            data_cleaned = self.response.get("data_cleaned")
+            if data_cleaned is None:
+                return None
+            return pd.DataFrame(data_cleaned)
         
     def get_data_raw(self):
         """
@@ -129,6 +132,22 @@ class LightweightDataCleaningAgent:
         """
         if self.response:
             return self.response.get("data_cleaner_function")
+
+    def get_cleaning_steps(self):
+        """
+        Retrieves the cleaning steps executed by the generated function.
+        """
+        if self.response:
+            return self.response.get("cleaning_steps") or []
+        return []
+
+    def get_data_cleaner_error(self):
+        """
+        Retrieves the latest data cleaner execution error, if any.
+        """
+        if self.response:
+            return self.response.get("data_cleaner_error")
+        return None
 
 
 # Agent Factory Function
@@ -179,6 +198,7 @@ def make_lightweight_data_cleaning_agent(
         user_instructions: str
         data_raw: dict
         data_cleaned: dict
+        cleaning_steps: list[str]
         data_cleaner_function: str
         data_cleaner_function_path: str
         data_cleaner_function_name: str
@@ -198,15 +218,40 @@ def make_lightweight_data_cleaning_agent(
 
         dataset_summary = get_dataframe_summary(df)
         
-        # TODO: Expand this prompt with more detailed cleaning instructions
+        # Prompt expanded with conservative datatype checks and additional cleaning features.
         data_cleaning_prompt = PromptTemplate(
             template="""
-            You are a Data Cleaning Agent. Create a {function_name}() function to clean the data.
+            You are a Data Cleaning Agent. Create a robust {function_name}() function that cleans a pandas DataFrame.
 
-            Basic Cleaning Steps to implement:
-            1. Remove columns with more than 40% missing values
-            2. Impute missing values (mean for numeric, mode for categorical)
-            3. Remove duplicate rows
+            Core requirements:
+            - Work on a copy of the input DataFrame.
+            - Keep cleaning conservative (avoid risky coercions or destructive changes when confidence is low).
+            - Return both cleaned data and a human-readable list of executed cleaning steps.
+
+            Basic Cleaning Steps to implement in this order:
+            1. standardize_column_names: strip whitespace and convert column names to lower snake_case
+            2. remove_sparse_columns: drop columns with more than 40% missing values
+            3. impute_missing_values: mean for numeric columns, mode for categorical columns
+            4. remove_duplicate_rows: remove exact duplicate rows
+            5. remove_outliers: for numeric columns with at least 20 non-null rows, drop rows outside IQR bounds (Q1 - 1.5*IQR, Q3 + 1.5*IQR)
+            6. clean_text_columns: trim strings and collapse repeated internal whitespace in object/string columns
+            7. conservative_fix_datatypes: check for datatype inconsistencies and convert only when confidence is high
+
+            Conservative datatype rules:
+            - Only convert string/object columns when at least 90% of non-null values parse successfully.
+            - Never auto-convert likely identifier columns (id, zip, code, phone, ssn, account).
+            - If a column has ambiguous mixed formats, keep original dtype and note that it was skipped.
+
+            Pandas assignment safety rules (required):
+            - Do NOT use chained assignment.
+            - Do NOT use inplace=True on Series operations.
+            - Do NOT write patterns like: df[col].fillna(value, inplace=True) or df.loc[mask][col] = value
+            - Use safe assignment patterns:
+              df[col] = df[col].fillna(value)
+              df.loc[mask, col] = value
+              df = df.drop_duplicates()
+              df = df.drop(columns=cols_to_drop)
+            - The final code should avoid SettingWithCopy/chained-assignment FutureWarnings.
 
             User Instructions:
             {user_instructions}
@@ -220,9 +265,8 @@ def make_lightweight_data_cleaning_agent(
                 import pandas as pd
                 import numpy as np
                 # Your cleaning code here
-                return data_cleaned
-
-            Important: Ensure fit_transform() outputs are flattened with .ravel() when assigning to DataFrame columns.
+                # cleaning_steps should be a list[str] with clear step descriptions
+                return data_cleaned, cleaning_steps
             """,
             input_variables=["user_instructions", "all_datasets_summary", "function_name"]
         )
@@ -259,7 +303,8 @@ def make_lightweight_data_cleaning_agent(
             result_key="data_cleaned",
             error_key="data_cleaner_error",
             code_snippet_key="data_cleaner_function",
-            agent_function_name=state.get("data_cleaner_function_name")
+            agent_function_name=state.get("data_cleaner_function_name"),
+            steps_key="cleaning_steps",
         )
         
     def fix_data_cleaner_code(state: GraphState):
@@ -270,6 +315,11 @@ def make_lightweight_data_cleaning_agent(
         You are a Data Cleaning Agent. Fix the broken {function_name}() function.
         
         Return Python code in ```python``` format with the corrected function definition.
+        Keep the return format as: return data_cleaned, cleaning_steps
+        Ensure pandas assignment safety:
+        - No chained assignment
+        - No inplace=True on Series methods
+        - Prefer df[col] = ... and df.loc[rows, col] = ...
         
         Broken code: 
         {code_snippet}
